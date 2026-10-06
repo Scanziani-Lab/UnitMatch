@@ -16,8 +16,12 @@ def get_default_param(param=None):
         The param dictionary
     """
     tmp = {
-        "spike_width": 82,  # will automatically update after loading in the waveform
-        "waveidx": np.arange(33, 56),  # what idxs cover the spike
+        "spike_width": 61,  # will automatically update after loading in the waveform. Upstream default 82
+        # NOTE: waveidx is derived from peak_loc below unless the caller passes
+        # its own. Do not hard-code a window here -- it must contain peak_loc, and
+        # peak_loc follows spike_width, which differs between sorters (KS4 -> 61,
+        # KS1-3 -> 82).
+        "waveidx": None,  # what idxs cover the spike
         "channel_radius": 150,  # the max distance channels which a unit will consider
         "max_dist": 100,  # max distance for possible matches
         "neighbour_dist": 50,
@@ -49,5 +53,14 @@ def get_default_param(param=None):
     # peak_loc always follows floor(spike_width / 2) unless the caller set it explicitly
     if param is None or "peak_loc" not in param:
         out["peak_loc"] = int(np.floor(out["spike_width"] / 2))
+
+    # waveidx must always bracket peak_loc -- metric_functions.centroid_metrics
+    # raises "param['peak_loc'] must be present in param['waveidx']" otherwise.
+    # Derive it from peak_loc (same window utils.paths_from_KS applies) unless the
+    # caller supplied one explicitly.
+    if out.get("waveidx") is None:
+        out["waveidx"] = np.arange(
+            out["peak_loc"] - 8, out["peak_loc"] + 15, dtype=int
+        )
 
     return out

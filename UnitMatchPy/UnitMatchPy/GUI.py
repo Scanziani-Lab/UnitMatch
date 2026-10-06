@@ -7,6 +7,42 @@ from matplotlib import rcParams
 import os
 import pickle
 
+# Extent of the root grid. Columns 0-7 are used (the histogram panel sits at
+# column 6 with columnspan 2); rows 0-6 are used (the raw-waveform and histogram
+# panels start at row 3 with rowspan 4). One spare column/row beyond these
+# carries the layout weight and absorbs any leftover space.
+N_GRID_COLS = 8
+N_GRID_ROWS = 7
+
+# Multiplier applied to every panel's figsize, so panels shrink to fit a narrow
+# screen instead of being compressed by Tk and clipped. 1.0 until run_GUI() and
+# update() recompute it.
+_fig_scale = 1.0
+_window_width = 1920
+
+
+def _scaled(w, h):
+    """Panel figsize in inches, scaled to the available window width."""
+    return (w * _fig_scale, h * _fig_scale)
+
+
+def _recompute_fig_scale(acg_shown):
+    """Size the panels for the panels that are actually going to be drawn.
+
+    Budgeting for the ACG panel unconditionally shrank everything to ~0.64 even
+    though ACGs are hidden by default, which left a wide empty margin and packed
+    the histogram titles together until they overlapped. Recomputed on every
+    update() so toggling a panel reflows the rest.
+    """
+    global _fig_scale
+    # widths in inches of the panels that sit side by side; the average-waveform
+    # panel shares column 0 with the (wider) score tables, so it costs nothing
+    panel_inches = 3 + 4 + 4 + (3 if acg_shown else 0)  # trajectory, raw, hist, ACG
+    fixed_px = 560 + 130  # tables column + inter-panel padding
+    _fig_scale = min(1.0, (_window_width - fixed_px) / (panel_inches * 100))
+    _fig_scale = max(0.55, _fig_scale)
+    return _fig_scale
+
 
 def precalculate_all_acgs(
     clus_info, param, save_path=None, bin_size=0.001, max_lag=0.05
@@ -248,11 +284,22 @@ def run_GUI():
     global acg_plot
     global toggle_acg_val
     global acg_cache
+    global info_frame
+    global legend_frame
+    global _window_width
 
     # Try to load pre-calculated ACG cache
     acg_cache = load_acg_cache()
 
-    rcParams.update({"figure.autolayout": True})
+    # Do NOT enable figure.autolayout globally. It applies tight_layout to every
+    # figure, and tight_layout gives up entirely (warning "Tight layout not
+    # applied. The bottom and top margins cannot be made large enough...") once a
+    # figure is shorter than roughly 1 inch. The ACG panel is gridded with
+    # sticky="nsew" so Tk shrinks it to its grid cell, which routinely crosses
+    # that threshold -- and when tight_layout bails, NO layout is applied at all
+    # and the panel's title/labels end up clipped. Each figure below sets its own
+    # layout engine instead; constrained layout degrades gracefully when small.
+    rcParams.update({"figure.autolayout": False})
     rcParams.update({"font.size": 14})
     rcParams.update({"font.family": "DejaVu Sans"})
     color = "white"
@@ -274,12 +321,18 @@ def run_GUI():
     window_height = screen_height - 100
     root.geometry(f"{window_width}x{window_height}+50+50")
 
-    # Configure column weights to prevent plot squashing
-    for i in range(7):  # Configure columns 0-6
-        root.columnconfigure(i, weight=1)
-    # Configure rows to expand properly
-    for i in range(10):  # Configure rows 0-9
-        root.rowconfigure(i, weight=1)
+    # Panel figure sizes are tuned for a ~1920px-wide screen. On anything
+    # narrower the panels would be compressed and their canvases clipped, so
+    # scale them to the space actually available. Column 0 is sized by the
+    # UnitData/UM Scores tables rather than by its plot, so it is budgeted as a
+    # fixed cost; the remaining panels (trajectory + ACG + raw + histograms)
+    # share what is left.
+    # Panel sizes are derived from the window width; update() recomputes this
+    # whenever a panel is toggled, so only the panels actually on screen are
+    # budgeted for.
+    _window_width = window_width
+
+    # Grid weights are configured after the widgets are gridded -- see below.
 
     # downloaded theme from https://sourceforge.net/projects/tcl-awthemes/
     theme_path_rel = os.path.join("TkinterTheme", "awthemes-10.4.0")
@@ -327,10 +380,23 @@ def run_GUI():
     score_table = ttk.LabelFrame(root)
     avg_waveform_plot = Canvas(root)
     trajectory_plot = Canvas(root)
-    bayes_label = ttk.Label(root)
-    original_id_label = ttk.Label(root)
     raw_waveform_plot = Canvas(root)
     hist_plot = Canvas(root)
+
+    # Container for the two wide read-out labels. They live in their own frame,
+    # spanning many columns, so their width is spread across the whole grid
+    # instead of forcing the individual columns that hold the plots. Previously
+    # they sat directly in columns 1 and 2 and inflated that pair to 538px when
+    # the trajectory plot beneath only needs ~300px -- the surplus pushed the
+    # histogram panel past the window edge, and Tk clipped it.
+    info_frame = ttk.Frame(root)
+    bayes_label = ttk.Label(info_frame)
+    original_id_label = ttk.Label(info_frame)
+
+    # Same reasoning for the two legend strips: 600px and 800px wide, they used
+    # to span columns 1-2 and 3-6 and forced those columns far wider than the
+    # plots beneath them needed.
+    legend_frame = ttk.Frame(root)
 
     # Unit entry
     ######################################################################################
@@ -492,8 +558,16 @@ def run_GUI():
 
     # MatchButtons
     ######################################################################################
-    match_button = ttk.Button(root, text="Set as Match", command=set_match)
-    non_match_button = ttk.Button(root, text="Set as Non Match", command=set_not_match)
+    # All of these live in one frame that spans the full width of the grid, so a
+    # long button/checkbox label only has to fit the window as a whole rather
+    # than forcing the single column it happens to sit above. Before this, the
+    # checkbuttons in row 1 and the read-out labels in row 2 were setting the
+    # widths of the columns that hold the plots in row 3.
+    controls_frame = ttk.Frame(root)
+    match_button = ttk.Button(controls_frame, text="Set as Match", command=set_match)
+    non_match_button = ttk.Button(
+        controls_frame, text="Set as Non Match", command=set_not_match
+    )
 
     # Toggle Plots
     ######################################################################################
@@ -504,13 +578,13 @@ def run_GUI():
     toggle_UM_score_val.set(False)
     toggle_acg_val.set(True)  # Default to hiding ACGs
     toggle_raw_plot = ttk.Checkbutton(
-        root, text="Hide Raw Data", variable=toggle_raw_val
+        controls_frame, text="Hide Raw Data", variable=toggle_raw_val
     )
     toggle_UM_score_plot = ttk.Checkbutton(
-        root, text="Hide UM Score Histograms", variable=toggle_UM_score_val
+        controls_frame, text="Hide UM Score Histograms", variable=toggle_UM_score_val
     )
     toggle_acg_plot = ttk.Checkbutton(
-        root, text="Hide Autocorrelograms (ACGs)", variable=toggle_acg_val
+        controls_frame, text="Hide Autocorrelograms (ACGs)", variable=toggle_acg_val
     )
 
     # Set up Key-Board shortcuts
@@ -527,11 +601,26 @@ def run_GUI():
 
     # Grid the units
     entry_frame.grid(row=2, column=0, pady=5, padx=5)
-    match_button.grid(row=1, column=0, sticky="W", padx=10, pady=5)
-    non_match_button.grid(row=1, column=1, sticky="W", padx=10, pady=5)
-    toggle_UM_score_plot.grid(row=1, column=2, sticky="W", padx=10, pady=5)
-    toggle_raw_plot.grid(row=1, column=3, sticky="W", padx=10, pady=5)
-    toggle_acg_plot.grid(row=1, column=4, sticky="W", padx=10, pady=5)
+
+    # Rows 0-2 are chrome: legends, controls, read-outs. Each is packed into a
+    # single frame spanning every column, so none of them constrains the width
+    # of an individual column. Only rows 3-5 (the plots and the tables) decide
+    # how wide each column is.
+    match_button.grid(row=0, column=0, sticky="W", padx=10, pady=5)
+    non_match_button.grid(row=0, column=1, sticky="W", padx=10, pady=5)
+    toggle_UM_score_plot.grid(row=0, column=2, sticky="W", padx=10, pady=5)
+    toggle_raw_plot.grid(row=0, column=3, sticky="W", padx=10, pady=5)
+    toggle_acg_plot.grid(row=0, column=4, sticky="W", padx=10, pady=5)
+    controls_frame.grid(row=1, column=0, columnspan=N_GRID_COLS, sticky="W")
+
+    # Start at column 1: entry_frame ("Select Units") already occupies row 2,
+    # column 0, and two widgets in the same cell simply overlap -- indenting this
+    # one with padx put it underneath instead of beside it. Spanning the
+    # remaining 7 columns still spreads its width thinly enough that it does not
+    # dictate any single plot column's size.
+    info_frame.grid(
+        row=2, column=1, columnspan=N_GRID_COLS - 1, sticky="W", padx=5
+    )
 
     # Create visual legend plots outside plots
     global unit_legend_plot
@@ -539,12 +628,26 @@ def run_GUI():
     create_unit_legend()
     create_hist_legend()
 
-    unit_legend_plot.grid(row=0, column=1, columnspan=2, sticky="W", padx=10, pady=5)
-    hist_legend_plot.grid(row=0, column=3, columnspan=4, sticky="W", padx=10, pady=5)
+    unit_legend_plot.grid(row=0, column=0, sticky="W", padx=10, pady=5)
+    hist_legend_plot.grid(row=0, column=1, sticky="W", padx=10, pady=5)
+    legend_frame.grid(row=0, column=0, columnspan=N_GRID_COLS, sticky="W")
 
-    # Configure grid weights to auto-adjust subpanels
-    root.grid_rowconfigure(0, weight=1)
-    root.grid_columnconfigure(0, weight=1)
+    # Column/row sizing.
+    # Every content column gets weight 0 so it is exactly as wide as the widest
+    # thing in it -- a column whose plot is toggled off then collapses to nothing
+    # instead of holding a gap open. A single trailing spacer column/row carries
+    # the weight and soaks up whatever is left over.
+    # (Previously all 7 columns and all 10 rows had weight=1, so Tk shared the
+    # slack evenly: an empty column still claimed ~57px, four empty rows claimed
+    # height, and the plot columns were compressed until the 400px histogram
+    # canvas no longer fit its 369px column and its titles were cut off.)
+    for i in range(N_GRID_COLS):
+        root.columnconfigure(i, weight=0)
+    for i in range(N_GRID_ROWS):
+        root.rowconfigure(i, weight=0)
+    root.columnconfigure(N_GRID_COLS, weight=1)
+    root.rowconfigure(N_GRID_ROWS, weight=1)
+
     entry_frame.grid_rowconfigure(0, weight=1)
     entry_frame.grid_columnconfigure(0, weight=1)
 
@@ -709,11 +812,14 @@ def process_info_for_GUI(
 def create_unit_legend():
     """Create visual legend for unit colors"""
     global unit_legend_plot
+    global legend_frame
 
     fig = Figure(figsize=(6, 0.5), dpi=100)
     fig.patch.set_facecolor("#33393b")
 
-    ax = fig.add_subplot(111)
+    # Full-bleed axes: this strip is only 0.5 in tall and has no decorations,
+    # so the default subplot margins would waste most of it.
+    ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor("#33393b")
 
     # Draw legend lines and text
@@ -727,7 +833,7 @@ def create_unit_legend():
     ax.set_ylim(0, 1)
     ax.axis("off")
 
-    unit_legend_plot = FigureCanvasTkAgg(fig, master=root)
+    unit_legend_plot = FigureCanvasTkAgg(fig, master=legend_frame)
     unit_legend_plot.draw()
     unit_legend_plot = unit_legend_plot.get_tk_widget()
 
@@ -735,11 +841,13 @@ def create_unit_legend():
 def create_hist_legend():
     """Create visual legend for histogram colors"""
     global hist_legend_plot
+    global legend_frame
 
     fig = Figure(figsize=(8, 0.5), dpi=100)
     fig.patch.set_facecolor("#33393b")
 
-    ax = fig.add_subplot(111)
+    # Full-bleed axes -- see create_unit_legend().
+    ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor("#33393b")
 
     # Draw legend elements
@@ -756,7 +864,7 @@ def create_hist_legend():
     ax.set_ylim(0, 1)
     ax.axis("off")
 
-    hist_legend_plot = FigureCanvasTkAgg(fig, master=root)
+    hist_legend_plot = FigureCanvasTkAgg(fig, master=legend_frame)
     hist_legend_plot.draw()
     hist_legend_plot = hist_legend_plot.get_tk_widget()
 
@@ -832,8 +940,11 @@ def plot_acgs(unit_a, unit_b):
     if "acg_plot" in globals() and acg_plot.winfo_exists():
         acg_plot.destroy()
 
-    # Create figure for single overlaid ACG plot
-    fig = Figure(figsize=(3, 3), dpi=100)
+    # Create figure for single overlaid ACG plot.
+    # This is the only panel gridded with sticky="nsew", so Tk stretches it to
+    # its grid cell; constrained layout keeps the title/labels readable at any
+    # size instead of bailing out the way tight_layout does.
+    fig = Figure(figsize=_scaled(3, 3), dpi=100, layout="constrained")
     fig.patch.set_facecolor("#33393b")
 
     # Create single subplot for overlaid ACGs
@@ -947,7 +1058,10 @@ def plot_acgs(unit_a, unit_b):
     acg_canvas = FigureCanvasTkAgg(fig, master=root)
     acg_canvas.draw()
     acg_plot = acg_canvas.get_tk_widget()
-    acg_plot.grid(row=3, column=3, rowspan=2, padx=5, pady=5, sticky="nsew")
+    # "nw" not "nsew": stretching this canvas was what let Tk shrink it below the
+    # height tight_layout could cope with. It is now sized by its figure like
+    # every other panel.
+    acg_plot.grid(row=3, column=3, rowspan=4, padx=10, pady=5, sticky="nw")
 
 
 def get_spike_times_for_unit(unit_id):
@@ -1029,6 +1143,11 @@ def update(event):
 
     unit_a = int(entry_a.get())
     unit_b = int(entry_b.get())
+
+    # Size the panels for whatever is about to be drawn. Doing this here rather
+    # than once at start-up means hiding a panel gives its width back to the
+    # others instead of leaving a wide empty margin.
+    _recompute_fig_scale(acg_shown=toggle_acg_val.get() is False)
 
     CV = get_cv_option()  # CV = 'Avg', if AVG is selcted else it equal [0,1] or [1,0]
     CV_option = CV_tkinter.get() - 1
@@ -1791,6 +1910,7 @@ def add_original_ID(UnitA, UnitB):
     global original_id_label
     global root
     global clus_info
+    global info_frame
 
     if original_id_label.winfo_exists():
         original_id_label.destroy()
@@ -1799,7 +1919,7 @@ def add_original_ID(UnitA, UnitB):
         original_id_a = int(clus_info["original_ids"][UnitA].squeeze())
         original_id_b = int(clus_info["original_ids"][UnitB].squeeze())
         original_id_label = ttk.Label(
-            root,
+            info_frame,
             text=f"The Original Unit IDs are:\nUnit A: {original_id_a}   Unit B: {original_id_b}",
             borderwidth=2,
             relief="groove",
@@ -1807,34 +1927,36 @@ def add_original_ID(UnitA, UnitB):
     except IndexError as e:
         print(f"Error: {e}")
         original_id_label = ttk.Label(
-            root, text="Error: Unit ID out of bounds", borderwidth=2, relief="groove"
+            info_frame,
+            text="Error: Unit ID out of bounds",
+            borderwidth=2,
+            relief="groove",
         )
 
-    original_id_label.grid(row=2, column=2, ipadx=5, ipady=5)
+    # inside info_frame, not the root grid -- see the note where info_frame is built
+    original_id_label.grid(row=0, column=1, ipadx=5, ipady=5, padx=(0, 10))
 
 
 def add_probability_label(UnitA, UnitB, CVoption):
     global bayes_label
+    global info_frame
 
     if bayes_label.winfo_exists():
         bayes_label.destroy()
 
     if CVoption == -1:
-        bayes_label = ttk.Label(
-            root,
-            text=f"The UM probabilty for this match is:\n {np.round(output_avg[UnitA, UnitB], 5)}",
-            borderwidth=2,
-            relief="groove",
-        )
-        bayes_label.grid(row=2, column=1, ipadx=5, ipady=5)
+        prob = np.round(output_avg[UnitA, UnitB], 5)
     else:
-        bayes_label = ttk.Label(
-            root,
-            text=f"The UM probabilty for this match is:\n {np.round(output_GUI[CVoption][UnitA, UnitB], 5)}",
-            borderwidth=2,
-            relief="groove",
-        )
-        bayes_label.grid(row=2, column=1, ipadx=5, ipady=5)
+        prob = np.round(output_GUI[CVoption][UnitA, UnitB], 5)
+
+    bayes_label = ttk.Label(
+        info_frame,
+        text=f"The UM probabilty for this match is:\n {prob}",
+        borderwidth=2,
+        relief="groove",
+    )
+    # inside info_frame, not the root grid -- see the note where info_frame is built
+    bayes_label.grid(row=0, column=0, ipadx=5, ipady=5, padx=(0, 10))
 
 
 def set_match(event=None):
@@ -1872,7 +1994,7 @@ def MakeTable(table):
             e.insert(END, table[i][j])
             e.configure(state="readonly")
             e.grid(row=i, column=j)
-    frame_table.grid(row=4, column=0, padx=10, pady=10)
+    frame_table.grid(row=4, column=0, padx=10, pady=10, sticky="nw")
 
 
 # get table data #ADD STABILTY - prob of unit with itself accros cv
@@ -2015,7 +2137,10 @@ def make_unit_score_table(table):
             e.configure(state="readonly")
             e.grid(row=i, column=j)
 
-    score_table.grid(row=5, column=0, columnspan=2, padx=10, pady=10)
+    # Single column and left-anchored, so it lines up with the UnitData table
+    # above it. Spanning columns 0-1 centred it across both and left it indented
+    # relative to UnitData -- and column 1 now holds the tall trajectory panel.
+    score_table.grid(row=5, column=0, padx=10, pady=10, sticky="nw")
 
 
 def plot_avg_waveforms(UnitA, UnitB, CV):
@@ -2023,7 +2148,11 @@ def plot_avg_waveforms(UnitA, UnitB, CV):
     if avg_waveform_plot.winfo_exists() == 1:
         avg_waveform_plot.destroy()
 
-    fig = Figure(figsize=(3, 3), dpi=100)
+    # Wider than tall: column 0 is ~460px because the UnitData/UM Scores tables
+    # beneath set its width, so a 300px-wide panel left a gap between this
+    # column and the next. Filling it costs no extra width and gives the
+    # waveform more horizontal room, which is the axis that matters here.
+    fig = Figure(figsize=_scaled(4.3, 3), dpi=100, layout="constrained")
     fig.patch.set_facecolor("#33393b")
 
     plt1 = fig.add_subplot(111)
@@ -2051,7 +2180,10 @@ def plot_avg_waveforms(UnitA, UnitB, CV):
     avg_waveform_plot = FigureCanvasTkAgg(fig, master=root)
     avg_waveform_plot.draw()
     avg_waveform_plot = avg_waveform_plot.get_tk_widget()
-    avg_waveform_plot.grid(row=3, column=0)
+    # sticky="nw": without it Tk centres the canvas in its cell, so this plot
+    # floated ~80px right of the UnitData table directly beneath it. Every panel
+    # and table in the plot area is top-left anchored so their edges line up.
+    avg_waveform_plot.grid(row=3, column=0, padx=10, pady=5, sticky="nw")
 
 
 def plot_trajectories(UnitA, UnitB, CV):
@@ -2059,12 +2191,18 @@ def plot_trajectories(UnitA, UnitB, CV):
     if trajectory_plot.winfo_exists() == 1:
         trajectory_plot.destroy()
 
-    fig = Figure(figsize=(3, 3), dpi=100)
+    # Tall: this panel spans rows 3-6 alongside the raw-waveform and histogram
+    # panels, and the y range it shows is much larger than the x range.
+    fig = Figure(figsize=_scaled(3, 6), dpi=100, layout="constrained")
     fig.patch.set_facecolor("#33393b")
 
     plt2 = fig.add_subplot(111)
     plt2.patch.set_facecolor("#2d2d2d")
-    plt2.set_aspect(0.5)
+    # adjustable="datalim" keeps the 0.5 aspect by padding the axis limits
+    # rather than shrinking the axes box. Probe trajectories span far more y
+    # (100s of um) than x (10s of um), so the default adjustable="box" collapsed
+    # this panel to ~13% of the figure width -- a thin unreadable sliver.
+    plt2.set_aspect(0.5, adjustable="datalim")
     plt2.spines[["right", "top"]].set_visible(False)
 
     if CV == "Avg":
@@ -2124,7 +2262,14 @@ def plot_trajectories(UnitA, UnitB, CV):
     trajectory_plot.draw()
     trajectory_plot = trajectory_plot.get_tk_widget()
     #    TrajectoryPlot.configure(bg = '#33393b')
-    trajectory_plot.grid(row=3, column=1, columnspan=2)
+    # Single column, not columnspan=2. When a panel spans two columns Tk only
+    # guarantees the PAIR is wide enough, and with the other spanning frames in
+    # play it settled ~9px short, cutting the right edge of the figure. Column 2
+    # is free now that the read-out labels live in info_frame.
+    # rowspan=4 to match the raw-waveform and histogram panels. Nothing else sits
+    # in this column, so a 3x3 panel left the whole lower half of it empty. A
+    # tall panel also suits the data: probe trajectories span far more y than x.
+    trajectory_plot.grid(row=3, column=1, rowspan=4, padx=10, pady=5, sticky="nw")
 
 
 def order_good_sites(good_sites, channel_pos, n_sessions):
@@ -2191,14 +2336,25 @@ def plot_raw_waveforms(unit_a, unit_b, CV):
     if raw_waveform_plot.winfo_exists() == 1:
         raw_waveform_plot.destroy()
 
-    fig = Figure(figsize=(4, 6), dpi=100)
-    fig.set_tight_layout(False)
+    # No layout engine: every axes below is positioned by hand with add_axes,
+    # so any automatic layout would fight the manual coordinates.
+    # (This used to call the now-deprecated fig.set_tight_layout(False) to undo
+    # the global figure.autolayout, which run_GUI no longer sets.)
+    fig = Figure(figsize=_scaled(4, 6), dpi=100, layout=None)
     fig.patch.set_facecolor("#33393b")
 
-    main_ax = fig.add_axes([0.2, 0.2, 0.8, 0.8])
+    # Margin for the y tick labels and the rotated y label. As a fixed 0.2 this
+    # was fine at the original 400px width but too tight once _fig_scale shrinks
+    # the figure -- the label ran off the left edge. Reserve a fixed ~74px
+    # instead, which is what the text actually needs at any figure width.
+    _fig_w_px = fig.get_size_inches()[0] * fig.dpi
+    main_ax_offset = float(min(0.34, max(0.2, 74.0 / _fig_w_px)))
+    main_ax_scale = 1.0 - main_ax_offset
+
+    main_ax = fig.add_axes(
+        [main_ax_offset, main_ax_offset, main_ax_scale, main_ax_scale]
+    )
     main_ax.set_facecolor("#2d2d2d")
-    main_ax_offset = 0.2
-    main_ax_scale = 0.8
 
     if CV == "Avg":
         good_channels = nearest_channels(
@@ -2314,7 +2470,7 @@ def plot_raw_waveforms(unit_a, unit_b, CV):
     # RawWaveformPlot.configure(bg = '#33393b')
 
     raw_waveform_plot.grid(
-        row=3, column=4, columnspan=2, rowspan=4, padx=15, pady=25, ipadx=15
+        row=3, column=4, rowspan=4, padx=10, pady=5, sticky="nw"
     )
 
 
@@ -2324,20 +2480,28 @@ def plot_histograms(hist_names, hist, hist_matched, scores_to_include, unit_a, u
     if hist_plot.winfo_exists() == 1:
         hist_plot.destroy()
 
-    fig = Figure(figsize=(4, 6), dpi=100, layout="constrained")
+    fig = Figure(figsize=_scaled(4, 6), dpi=100, layout="constrained")
     fig.patch.set_facecolor("#33393b")
     axs = fig.subplots(3, 2, sharex="col")
     axs = axs.flat
 
-    # Create title mapping
+    # Create title mapping.
+    # These sit two-to-a-row in a ~320px figure, so each has roughly 130px. The
+    # trailing "score" on every one pushed the right-hand column's titles past
+    # the figure edge and into their neighbours; the panel is already labelled
+    # "UM Score Histograms", so it is redundant.
     title_mapping = {
-        "amp_score": "Amplitude score",
-        "spatial_decay_score": "Spatial decay score",
-        "centroid_overlord_score": "C'oid overlord score",
-        "centroid_dist": "C'oid distance score",
-        "waveform_score": "Waveform score",
-        "trajectory_score": "Trajectory score",
+        "amp_score": "Amplitude",
+        "spatial_decay_score": "Spatial decay",
+        "centroid_overlord_score": "C'oid overlord",
+        "centroid_dist": "C'oid distance",
+        "waveform_score": "Waveform",
+        "trajectory_score": "Trajectory",
     }
+    # Shrink the type along with the panel so the titles keep fitting when the
+    # window is narrow enough to force _fig_scale down.
+    title_size = max(7, round(11 * _fig_scale))
+    label_size = max(6, round(9 * _fig_scale))
 
     # loop over indexes..
     for i in range(len(hist)):
@@ -2357,10 +2521,11 @@ def plot_histograms(hist_names, hist, hist_matched, scores_to_include, unit_a, u
 
         # Use improved title from mapping
         plot_title = title_mapping.get(hist_names[i], hist_names[i])
-        axs[i].set_title(plot_title, fontsize=12)
+        axs[i].set_title(plot_title, fontsize=title_size)
 
         # Add ylabel
-        axs[i].set_ylabel("% units", fontsize=10)
+        axs[i].set_ylabel("% units", fontsize=label_size)
+        axs[i].tick_params(labelsize=label_size)
 
         axs[i].axvline(
             scores_to_include[hist_names[i]][unit_a, unit_b],
@@ -2374,4 +2539,4 @@ def plot_histograms(hist_names, hist, hist_matched, scores_to_include, unit_a, u
     hist_plot.draw()
     hist_plot = hist_plot.get_tk_widget()
 
-    hist_plot.grid(row=3, column=6, columnspan=2, rowspan=4, padx=5, pady=20)
+    hist_plot.grid(row=3, column=6, rowspan=4, padx=10, pady=5, sticky="nw")
